@@ -22,6 +22,9 @@ pub enum DataError {
     #[error("initial snapshot invalid: {0}")]
     InitialSnapshotInvalid(String),
 
+    #[error("HTTP request failed: {0}")]
+    Http(String),
+
     #[error("SocketError: {0}")]
     Socket(String),
 

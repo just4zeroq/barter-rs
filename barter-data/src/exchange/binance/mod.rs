@@ -1,13 +1,17 @@
 use self::{
-    book::l1::BinanceOrderBookL1, channel::BinanceChannel, market::BinanceMarket,
-    subscription::BinanceSubResponse, trade::BinanceTrade,
+    agg_trade::BinanceAggTrade, book::l1::BinanceOrderBookL1, candle::BinanceCandle,
+    channel::BinanceChannel, market::BinanceMarket, subscription::BinanceSubResponse,
+    ticker::BinanceTicker, trade::BinanceTrade,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
-    subscription::{Map, book::OrderBooksL1, trade::PublicTrades},
+    subscription::{
+        Map, agg_trade::AggTrades, book::OrderBooksL1, candle::Candles, ticker::Tickers,
+        trade::PublicTrades,
+    },
     transformer::stateless::StatelessTransformer,
 };
 use barter_instrument::exchange::ExchangeId;
@@ -15,9 +19,30 @@ use barter_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
 use std::{fmt::Debug, marker::PhantomData};
 use url::Url;
 
+/// Aggregated trade types common to both [`BinanceSpot`](spot::BinanceSpot) and
+/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+pub mod agg_trade;
+
 /// OrderBook types common to both [`BinanceSpot`](spot::BinanceSpot) and
 /// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
 pub mod book;
+
+/// Kline / candlestick types common to both [`BinanceSpot`](spot::BinanceSpot) and
+/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+pub mod candle;
+
+/// 24hr mini ticker types common to both [`BinanceSpot`](spot::BinanceSpot) and
+/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+pub mod ticker;
+
+/// Mark price / funding rate types for [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+pub mod funding;
+
+/// Whole-market (All symbol) [`Subscription`](crate::subscription::Subscription) types for
+/// [`BinanceSpot`](spot::BinanceSpot) and [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+///
+/// Consumes a single stream (eg/ `!miniTicker@arr`) that broadcasts events for every symbol.
+pub mod whole_market;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
@@ -121,6 +146,36 @@ where
     type Stream = BinanceWsStream<
         StatelessTransformer<Self, Instrument::Key, OrderBooksL1, BinanceOrderBookL1>,
     >;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, AggTrades> for Binance<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<StatelessTransformer<Self, Instrument::Key, AggTrades, BinanceAggTrade>>;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, Tickers> for Binance<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<StatelessTransformer<Self, Instrument::Key, Tickers, BinanceTicker>>;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, Candles> for Binance<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<StatelessTransformer<Self, Instrument::Key, Candles, BinanceCandle>>;
 }
 
 impl<'de, Server> serde::Deserialize<'de> for Binance<Server>

@@ -17,11 +17,20 @@ use std::{borrow::Borrow, fmt::Debug, hash::Hash};
 /// OrderBook [`SubscriptionKind`]s and the associated Barter output data models.
 pub mod book;
 
+/// Aggregated trade [`SubscriptionKind`] and the associated Barter output data model.
+pub mod agg_trade;
+
 /// Candle [`SubscriptionKind`] and the associated Barter output data model.
 pub mod candle;
 
+/// Funding rate [`SubscriptionKind`] and the associated Barter output data model.
+pub mod funding;
+
 /// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
 pub mod liquidation;
+
+/// Ticker [`SubscriptionKind`] and the associated Barter output data model.
+pub mod ticker;
 
 /// Public trade [`SubscriptionKind`] and the associated Barter output data model.
 pub mod trade;

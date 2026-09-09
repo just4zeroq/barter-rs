@@ -10,10 +10,13 @@ use crate::{
                 BinanceFuturesUsdOrderBooksL2SnapshotFetcher,
                 BinanceFuturesUsdOrderBooksL2Transformer,
             },
+            funding::BinanceFundingRate,
         },
     },
     instrument::InstrumentData,
-    subscription::{book::OrderBooksL2, liquidation::Liquidations},
+    subscription::{
+        book::OrderBooksL2, funding::FundingRates, liquidation::Liquidations,
+    },
     transformer::stateless::StatelessTransformer,
 };
 use barter_instrument::exchange::ExchangeId;
@@ -60,6 +63,16 @@ where
     type SnapFetcher = NoInitialSnapshots;
     type Stream = BinanceWsStream<
         StatelessTransformer<Self, Instrument::Key, Liquidations, BinanceLiquidation>,
+    >;
+}
+
+impl<Instrument> StreamSelector<Instrument, FundingRates> for BinanceFuturesUsd
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = BinanceWsStream<
+        StatelessTransformer<Self, Instrument::Key, FundingRates, BinanceFundingRate>,
     >;
 }
 

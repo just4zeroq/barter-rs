@@ -2,9 +2,12 @@ use crate::{
     error::DataError,
     streams::consumer::MarketStreamResult,
     subscription::{
+        agg_trade::AggTrade,
         book::{OrderBookEvent, OrderBookL1},
         candle::Candle,
+        funding::FundingRate,
         liquidation::Liquidation,
+        ticker::Ticker,
         trade::PublicTrade,
     },
 };
@@ -91,6 +94,27 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    pub fn as_ticker(&self) -> Option<MarketEvent<&InstrumentKey, &Ticker>> {
+        match &self.kind {
+            DataKind::Ticker(ticker) => Some(self.as_event(ticker)),
+            _ => None,
+        }
+    }
+
+    pub fn as_funding_rate(&self) -> Option<MarketEvent<&InstrumentKey, &FundingRate>> {
+        match &self.kind {
+            DataKind::FundingRate(funding_rate) => Some(self.as_event(funding_rate)),
+            _ => None,
+        }
+    }
+
+    pub fn as_agg_trade(&self) -> Option<MarketEvent<&InstrumentKey, &AggTrade>> {
+        match &self.kind {
+            DataKind::AggTrade(agg_trade) => Some(self.as_event(agg_trade)),
+            _ => None,
+        }
+    }
+
     pub fn as_liquidation(&self) -> Option<MarketEvent<&InstrumentKey, &Liquidation>> {
         match &self.kind {
             DataKind::Liquidation(liquidation) => Some(self.as_event(liquidation)),
@@ -126,6 +150,9 @@ pub enum DataKind {
     OrderBookL1(OrderBookL1),
     OrderBook(OrderBookEvent),
     Candle(Candle),
+    Ticker(Ticker),
+    FundingRate(FundingRate),
+    AggTrade(AggTrade),
     Liquidation(Liquidation),
 }
 
@@ -136,6 +163,9 @@ impl DataKind {
             DataKind::OrderBookL1(_) => "l1",
             DataKind::OrderBook(_) => "l2",
             DataKind::Candle(_) => "candle",
+            DataKind::Ticker(_) => "ticker",
+            DataKind::FundingRate(_) => "funding_rate",
+            DataKind::AggTrade(_) => "agg_trade",
             DataKind::Liquidation(_) => "liquidation",
         }
     }
@@ -202,6 +232,54 @@ impl<InstrumentKey> From<MarketEvent<InstrumentKey, Candle>>
 {
     fn from(value: MarketEvent<InstrumentKey, Candle>) -> Self {
         value.map_kind(Candle::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, Ticker>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, Ticker>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, Ticker>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, Ticker>) -> Self {
+        value.map_kind(Ticker::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, FundingRate>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, FundingRate>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, FundingRate>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, FundingRate>) -> Self {
+        value.map_kind(FundingRate::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, AggTrade>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, AggTrade>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, AggTrade>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, AggTrade>) -> Self {
+        value.map_kind(AggTrade::into)
     }
 }
 
