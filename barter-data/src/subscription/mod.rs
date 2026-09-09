@@ -3,7 +3,10 @@ use barter_instrument::{
     Keyed,
     asset::name::AssetNameInternal,
     exchange::ExchangeId,
-    instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+    instrument::{
+        market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+        name::InstrumentNameInternal,
+    },
 };
 use barter_integration::{
     Validator, error::SocketError, protocol::websocket::WsMessage, subscription::SubscriptionId,
@@ -141,6 +144,49 @@ where
         let instrument = Keyed::new(instrument_id, (base, quote, instrument_kind).into());
 
         Self::new(exchange, instrument, kind)
+    }
+}
+
+impl<Exchange, Kind> Subscription<Exchange, Keyed<InstrumentNameInternal, MarketDataInstrument>, Kind>
+where
+    Exchange: Connector,
+{
+    /// Construct a per-symbol [`Subscription`] keyed by [`InstrumentNameInternal`] from an exchange,
+    /// base and quote asset.
+    ///
+    /// ### Notes
+    /// The [`InstrumentData::Key`] is derived as `"{exchange_id}-{base}{quote}"`
+    /// (eg/ `binance_spot-btcusdt`) using the exact same [`InstrumentNameInternal::new_from_exchange`]
+    /// rule that whole-market streams derive from each event's own `subscription_id`. Hence per-symbol
+    /// and whole-market subscriptions over the same market yield identical `InstrumentNameInternal`
+    /// event keys and can be merged into a single typed stream.
+    ///
+    /// Explicitly an associated function (not a tuple `From`): a second `From` impl sharing the
+    /// `(Exchange, S, S, MarketDataInstrumentKind, Kind)` arity of the existing default
+    /// [`MarketDataInstrument`] `From` would make `.into()` inference ambiguous (E0283).
+    pub fn keyed_from_base_quote<S>(
+        exchange: Exchange,
+        base: S,
+        quote: S,
+        instrument_kind: MarketDataInstrumentKind,
+        sub_kind: Kind,
+    ) -> Self
+    where
+        S: Into<AssetNameInternal> + AsRef<str>,
+    {
+        let base_ref = base.as_ref();
+        let quote_ref = quote.as_ref();
+
+        // Derive the same InstrumentNameInternal key that whole-market streams produce from their
+        // per-event subscription IDs (eg/ "@miniTicker|BTCUSDT" -> "binance_spot-btcusdt")
+        let key = InstrumentNameInternal::new_from_exchange(
+            Exchange::ID,
+            format_smolstr!("{base_ref}{quote_ref}"),
+        );
+
+        let instrument = Keyed::new(key, (base, quote, instrument_kind).into());
+
+        Self::new(exchange, instrument, sub_kind)
     }
 }
 
@@ -353,6 +399,61 @@ mod tests {
             subscription::trade::PublicTrades,
         };
         use barter_instrument::instrument::market_data::MarketDataInstrument;
+
+        use crate::{
+            exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
+            subscription::ticker::Tickers,
+        };
+        use barter_instrument::{
+            exchange::ExchangeId, instrument::name::InstrumentNameInternal,
+        };
+
+        #[test]
+        fn test_keyed_subscription_matches_whole_market_key() {
+            // The per-symbol keyed constructor derives the exact InstrumentNameInternal that
+            // whole-market streams derive from each event's subscription_id
+            // (eg/ "@miniTicker|BTCUSDT" -> "binance_spot-btcusdt")
+            let spot = Subscription::keyed_from_base_quote(
+                BinanceSpot::default(),
+                "BTC",
+                "USDT",
+                MarketDataInstrumentKind::Spot,
+                Tickers,
+            );
+
+            let perpetual = Subscription::keyed_from_base_quote(
+                BinanceFuturesUsd::default(),
+                "btc",
+                "usdt",
+                MarketDataInstrumentKind::Perpetual,
+                Tickers,
+            );
+
+            assert_eq!(
+                spot.instrument.key().as_ref(),
+                "binance_spot-btcusdt"
+            );
+            assert_eq!(
+                perpetual.instrument.key().as_ref(),
+                "binance_futures_usd-btcusdt"
+            );
+
+            // Match the whole-market key derivation rule exactly
+            assert_eq!(
+                spot.instrument.key(),
+                &InstrumentNameInternal::new_from_exchange(
+                    ExchangeId::BinanceSpot,
+                    "BTCUSDT"
+                )
+            );
+            assert_eq!(
+                perpetual.instrument.key(),
+                &InstrumentNameInternal::new_from_exchange(
+                    ExchangeId::BinanceFuturesUsd,
+                    "BTCUSDT"
+                )
+            );
+        }
 
         mod de {
             use super::*;

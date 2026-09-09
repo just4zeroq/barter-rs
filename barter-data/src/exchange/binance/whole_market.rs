@@ -12,9 +12,7 @@ use crate::{
     exchange::{ExchangeServer, StreamSelector},
     instrument::InstrumentData,
     subscription::{
-        Map, Subscription,
-        funding::{AllFundingRates, FundingRate},
-        ticker::{AllTickers, Ticker},
+        Map, Subscription, SubscriptionKind, funding::AllFundingRates, ticker::AllTickers,
     },
     transformer::ExchangeTransformer,
 };
@@ -22,29 +20,18 @@ use async_trait::async_trait;
 use barter_instrument::{
     asset::name::AssetNameInternal,
     exchange::ExchangeId,
-    instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+    instrument::{
+        market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+        name::InstrumentNameInternal,
+    },
 };
 use barter_integration::{
-    Transformer,
-    protocol::websocket::WsMessage,
+    Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
 };
 use serde::Deserialize;
-use smol_str::SmolStr;
-use std::{collections::HashMap, fmt, marker::PhantomData};
+use smol_str::{SmolStr, format_smolstr};
+use std::{fmt, marker::PhantomData};
 use tokio::sync::mpsc::UnboundedSender;
-
-/// [`BinanceSpot`] HTTP exchange information url, used to resolve every streaming symbol into a
-/// normalised [`MarketDataInstrument`].
-///
-/// See docs: <https://binance-docs.github.io/apidocs/spot/en/#exchange-information>
-const HTTP_EXCHANGE_INFO_BINANCE_SPOT: &str = "https://api.binance.com/api/v3/exchangeInfo";
-
-/// [`BinanceFuturesUsd`] HTTP exchange information url, used to resolve every streaming symbol into
-/// a normalised [`MarketDataInstrument`].
-///
-/// See docs: <https://binance-docs.github.io/apidocs/futures/en/#exchange-information>
-const HTTP_EXCHANGE_INFO_BINANCE_FUTURES_USD: &str =
-    "https://fapi.binance.com/fapi/v1/exchangeInfo";
 
 /// Whole-market [`Subscription`] instrument used to subscribe to a single stream that broadcasts
 /// events for *every* symbol (eg/ Binance `!miniTicker@arr`).
@@ -52,11 +39,12 @@ const HTTP_EXCHANGE_INFO_BINANCE_FUTURES_USD: &str =
 /// ### Notes
 /// - The wrapped [`MarketDataInstrument`] is only used to communicate the exchange
 ///   [`MarketDataInstrumentKind`] to [`Validator`](barter_integration::Validator) logic; whole-market
-///   events are emitted with a real per-symbol [`MarketDataInstrument`] resolved from the exchange
-///   universe (eg/ fetched via `GET /exchangeInfo`).
+///   events are emitted with a per-symbol [`InstrumentNameInternal`] resolved directly from each
+///   streamed event (eg/ `binance_spot-btcusdt`), hence no exchange universe is fetched.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct WholeMarketInstrument {
     representative: MarketDataInstrument,
+    key: InstrumentNameInternal,
 }
 
 impl WholeMarketInstrument {
@@ -72,17 +60,27 @@ impl WholeMarketInstrument {
     where
         S: Into<AssetNameInternal>,
     {
+        let representative = MarketDataInstrument::new(base, quote, kind);
+
         Self {
-            representative: MarketDataInstrument::new(base, quote, kind),
+            key: InstrumentNameInternal::new(format_smolstr!(
+                "whole_market_{}",
+                representative.kind
+            )),
+            representative,
         }
     }
 }
 
 impl InstrumentData for WholeMarketInstrument {
-    type Key = MarketDataInstrument;
+    type Key = InstrumentNameInternal;
 
+    /// ### Notes
+    /// Whole-market [`Subscription`]s have no single instrument, hence this `Key` only ever keys
+    /// the (unused) `instrument_map` built during subscription. Consumed events are keyed by the
+    /// per-symbol [`InstrumentNameInternal`] resolved in the associated [`ExchangeTransformer`].
     fn key(&self) -> &Self::Key {
-        &self.representative
+        &self.key
     }
 
     fn kind(&self) -> &MarketDataInstrumentKind {
@@ -92,7 +90,7 @@ impl InstrumentData for WholeMarketInstrument {
 
 impl fmt::Display for WholeMarketInstrument {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "whole_market_{}", self.representative.kind)
+        write!(f, "{}", self.key)
     }
 }
 
@@ -126,204 +124,108 @@ impl Identifier<BinanceChannel>
 /// [`StreamSelector`] for [`BinanceSpot`] whole-market [`AllTickers`] streams.
 impl StreamSelector<WholeMarketInstrument, AllTickers> for BinanceSpot {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream = BinanceWsStream<BinanceWholeMarketTickerTransformer<BinanceServerSpot>>;
+    type Stream = BinanceWsStream<
+        BinanceWholeMarketTransformer<BinanceServerSpot, AllTickers, BinanceTicker>,
+    >;
 }
 
 /// [`StreamSelector`] for [`BinanceFuturesUsd`] whole-market [`AllTickers`] streams.
 impl StreamSelector<WholeMarketInstrument, AllTickers> for BinanceFuturesUsd {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream =
-        BinanceWsStream<BinanceWholeMarketTickerTransformer<BinanceServerFuturesUsd>>;
+    type Stream = BinanceWsStream<
+        BinanceWholeMarketTransformer<BinanceServerFuturesUsd, AllTickers, BinanceTicker>,
+    >;
 }
 
 /// [`StreamSelector`] for [`BinanceFuturesUsd`] whole-market [`AllFundingRates`] streams.
 impl StreamSelector<WholeMarketInstrument, AllFundingRates> for BinanceFuturesUsd {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = BinanceWsStream<
-        BinanceWholeMarketFundingRateTransformer<BinanceServerFuturesUsd>,
+        BinanceWholeMarketTransformer<BinanceServerFuturesUsd, AllFundingRates, BinanceFundingRate>,
     >;
 }
 
-/// [`Binance`] whole-market [`AllTickers`] [`ExchangeTransformer`] that translates the
-/// `!miniTicker@arr` array stream into one normalised [`Ticker`] [`MarketEvent`] per symbol.
+/// Generic stateless [`ExchangeTransformer`] for [`Binance`] whole-market array streams (eg/
+/// `!miniTicker@arr`, `!markPrice@arr`), translating each streamed array into one normalised
+/// [`MarketEvent`] per symbol.
 ///
 /// ### Notes
-/// The per-symbol [`MarketDataInstrument`] universe is resolved on initialisation from the
-/// associated exchange `GET /exchangeInfo` endpoint.
-#[derive(Debug)]
-pub struct BinanceWholeMarketTickerTransformer<Server> {
-    universe: HashMap<String, MarketDataInstrument>,
-    _phantom: PhantomData<Server>,
+/// This is the whole-market counterpart of
+/// [`StatelessTransformer`](crate::transformer::stateless::StatelessTransformer): rather than
+/// resolving each event against the `instrument_map` built at subscription time, the per-symbol
+/// `InstrumentKey` is derived from each event's own [`SubscriptionId`] (eg/ `@miniTicker|BTCUSDT`),
+/// combined with the [`ExchangeId`] into an [`InstrumentNameInternal`] (eg/
+/// `binance_spot-btcusdt`).
+///
+/// Because no exchange universe is fetched, initialisation performs no IO and newly listed symbols
+/// are streamed without requiring a reconnection.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct BinanceWholeMarketTransformer<Server, Kind, Input> {
+    phantom: PhantomData<(Server, Kind, Input)>,
 }
 
 #[async_trait]
-impl<Server> ExchangeTransformer<Binance<Server>, MarketDataInstrument, AllTickers>
-    for BinanceWholeMarketTickerTransformer<Server>
+impl<Server, Kind, Input> ExchangeTransformer<Binance<Server>, InstrumentNameInternal, Kind>
+    for BinanceWholeMarketTransformer<Server, Kind, Input>
 where
-    Server: ExchangeServer,
+    Server: ExchangeServer + Send,
+    Kind: SubscriptionKind + Send,
+    Input: Identifier<Option<SubscriptionId>> + for<'de> Deserialize<'de>,
+    MarketIter<InstrumentNameInternal, Kind::Event>:
+        From<(ExchangeId, InstrumentNameInternal, Input)>,
 {
     async fn init(
-        _instrument_map: Map<MarketDataInstrument>,
-        _initial_snapshots: &[MarketEvent<MarketDataInstrument, Ticker>],
+        _instrument_map: Map<InstrumentNameInternal>,
+        _initial_snapshots: &[MarketEvent<InstrumentNameInternal, Kind::Event>],
         _ws_sink_tx: UnboundedSender<WsMessage>,
     ) -> Result<Self, DataError> {
-        let universe = fetch_binance_exchange_universe::<Server>().await?;
-
         Ok(Self {
-            universe,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         })
     }
 }
 
-impl<Server> Transformer for BinanceWholeMarketTickerTransformer<Server>
+impl<Server, Kind, Input> Transformer for BinanceWholeMarketTransformer<Server, Kind, Input>
 where
     Server: ExchangeServer,
+    Kind: SubscriptionKind,
+    Input: Identifier<Option<SubscriptionId>> + for<'de> Deserialize<'de>,
+    MarketIter<InstrumentNameInternal, Kind::Event>:
+        From<(ExchangeId, InstrumentNameInternal, Input)>,
 {
     type Error = DataError;
-    type Input = Vec<BinanceTicker>;
-    type Output = MarketEvent<MarketDataInstrument, Ticker>;
+    type Input = Vec<Input>;
+    type Output = MarketEvent<InstrumentNameInternal, Kind::Event>;
     type OutputIter = Vec<Result<Self::Output, Self::Error>>;
 
     fn transform(&mut self, input: Self::Input) -> Self::OutputIter {
         let mut events = Vec::with_capacity(input.len());
 
-        for ticker in input {
-            // Determine the symbol associated with this whole-market element (eg/ "@miniTicker|BTCUSDT")
-            let Some(symbol) = market_from_subscription_id(ticker.subscription_id.as_ref()) else {
+        for element in input {
+            // Determine the symbol associated with this whole-market element, which is carried by
+            // the element's own SubscriptionId (eg/ "@miniTicker|BTCUSDT" -> "BTCUSDT")
+            let Some(subscription_id) = element.id() else {
                 continue;
             };
 
-            if let Some(instrument) = self.universe.get(symbol) {
-                events.extend(
-                    MarketIter::<MarketDataInstrument, Ticker>::from((
-                        Server::ID,
-                        instrument.clone(),
-                        ticker,
-                    ))
-                    .0,
-                );
-            }
-        }
-
-        events
-    }
-}
-
-/// [`Binance`] whole-market [`AllFundingRates`] [`ExchangeTransformer`] that translates the
-/// `!markPrice@arr` array stream into one normalised [`FundingRate`] [`MarketEvent`] per symbol.
-///
-/// ### Notes
-/// The per-symbol [`MarketDataInstrument`] universe is resolved on initialisation from the
-/// associated exchange `GET /exchangeInfo` endpoint.
-#[derive(Debug)]
-pub struct BinanceWholeMarketFundingRateTransformer<Server> {
-    universe: HashMap<String, MarketDataInstrument>,
-    _phantom: PhantomData<Server>,
-}
-
-#[async_trait]
-impl<Server> ExchangeTransformer<Binance<Server>, MarketDataInstrument, AllFundingRates>
-    for BinanceWholeMarketFundingRateTransformer<Server>
-where
-    Server: ExchangeServer,
-{
-    async fn init(
-        _instrument_map: Map<MarketDataInstrument>,
-        _initial_snapshots: &[MarketEvent<MarketDataInstrument, FundingRate>],
-        _ws_sink_tx: UnboundedSender<WsMessage>,
-    ) -> Result<Self, DataError> {
-        let universe = fetch_binance_exchange_universe::<Server>().await?;
-
-        Ok(Self {
-            universe,
-            _phantom: PhantomData,
-        })
-    }
-}
-
-impl<Server> Transformer for BinanceWholeMarketFundingRateTransformer<Server>
-where
-    Server: ExchangeServer,
-{
-    type Error = DataError;
-    type Input = Vec<BinanceFundingRate>;
-    type Output = MarketEvent<MarketDataInstrument, FundingRate>;
-    type OutputIter = Vec<Result<Self::Output, Self::Error>>;
-
-    fn transform(&mut self, input: Self::Input) -> Self::OutputIter {
-        let mut events = Vec::with_capacity(input.len());
-
-        for funding in input {
-            // Determine the symbol associated with this whole-market element (eg/ "@markPrice|BTCUSDT")
-            let Some(symbol) = market_from_subscription_id(funding.subscription_id.as_ref()) else {
+            let Some(symbol) = market_from_subscription_id(subscription_id.as_ref()) else {
                 continue;
             };
 
-            if let Some(instrument) = self.universe.get(symbol) {
-                events.extend(
-                    MarketIter::<MarketDataInstrument, FundingRate>::from((
-                        Server::ID,
-                        instrument.clone(),
-                        funding,
-                    ))
-                    .0,
-                );
-            }
-        }
+            let instrument = InstrumentNameInternal::new_from_exchange(Server::ID, symbol);
 
-        events
-    }
-}
-
-/// Fetches the exchange universe from `GET /exchangeInfo`, mapping every streamed symbol into a
-/// normalised [`MarketDataInstrument`].
-///
-/// ### Notes
-/// - [`BinanceSpot`] maps every listed symbol to a [`Spot`](MarketDataInstrumentKind::Spot)
-///   [`MarketDataInstrument`].
-/// - [`BinanceFuturesUsd`] only maps perpetual contracts (`contractType == "PERPETUAL"`) to a
-///   [`Perpetual`](MarketDataInstrumentKind::Perpetual) [`MarketDataInstrument`], dropping
-///   quarterlies/deliverables.
-async fn fetch_binance_exchange_universe<Server>() -> Result<HashMap<String, MarketDataInstrument>, DataError>
-where
-    Server: ExchangeServer,
-{
-    let (url, kind_filter) = match Server::ID {
-        ExchangeId::BinanceSpot => (
-            HTTP_EXCHANGE_INFO_BINANCE_SPOT,
-            spot_filter as fn(&BinanceExchangeInfoSymbol) -> Option<MarketDataInstrumentKind>,
-        ),
-        ExchangeId::BinanceFuturesUsd => (
-            HTTP_EXCHANGE_INFO_BINANCE_FUTURES_USD,
-            perpetual_filter as fn(&BinanceExchangeInfoSymbol) -> Option<MarketDataInstrumentKind>,
-        ),
-        exchange => {
-            return Err(DataError::Socket(format!(
-                "unsupported whole-market exchange: {exchange}"
-            )))
-        }
-    };
-
-    let info = reqwest::get(url)
-        .await
-        .map_err(|error| DataError::Http(error.to_string()))?
-        .json::<BinanceExchangeInfo>()
-        .await
-        .map_err(|error| DataError::Http(error.to_string()))?;
-
-    let mut universe = HashMap::with_capacity(info.symbols.len());
-
-    for symbol in info.symbols {
-        if let Some(kind) = kind_filter(&symbol) {
-            universe.insert(
-                symbol.symbol.clone(),
-                MarketDataInstrument::new(symbol.base_asset, symbol.quote_asset, kind),
+            events.extend(
+                MarketIter::<InstrumentNameInternal, Kind::Event>::from((
+                    Server::ID,
+                    instrument,
+                    element,
+                ))
+                .0,
             );
         }
-    }
 
-    Ok(universe)
+        events
+    }
 }
 
 /// Determines whether a whole-market [`BinanceTicker`] / [`BinanceFundingRate`] subscription id
@@ -333,41 +235,10 @@ fn market_from_subscription_id(subscription_id: &str) -> Option<&str> {
     subscription_id.split_once('|').map(|(_, market)| market)
 }
 
-/// Whole-market instrument kind filter for [`BinanceSpot`]: every listed symbol is a spot market.
-fn spot_filter(_: &BinanceExchangeInfoSymbol) -> Option<MarketDataInstrumentKind> {
-    Some(MarketDataInstrumentKind::Spot)
-}
-
-/// Whole-market instrument kind filter for [`BinanceFuturesUsd`]: only perpetual contracts are
-/// mapped (dropping quarterly & delivery contracts).
-fn perpetual_filter(symbol: &BinanceExchangeInfoSymbol) -> Option<MarketDataInstrumentKind> {
-    match symbol.contract_type.as_deref() {
-        Some("PERPETUAL") => Some(MarketDataInstrumentKind::Perpetual),
-        _ => None,
-    }
-}
-
-/// Minimal `GET /exchangeInfo` response representation.
-#[derive(Debug, Deserialize)]
-struct BinanceExchangeInfo {
-    symbols: Vec<BinanceExchangeInfoSymbol>,
-}
-
-/// A single symbol entry in the `GET /exchangeInfo` response.
-#[derive(Debug, Deserialize)]
-struct BinanceExchangeInfoSymbol {
-    symbol: String,
-    #[serde(rename = "baseAsset")]
-    base_asset: String,
-    #[serde(rename = "quoteAsset")]
-    quote_asset: String,
-    #[serde(rename = "contractType", default)]
-    contract_type: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barter_instrument::exchange::ExchangeId;
     use barter_integration::serde::de::datetime_utc_from_epoch_duration;
     use std::time::Duration;
 
@@ -385,56 +256,112 @@ mod tests {
     }
 
     #[test]
-    fn test_de_binance_exchange_info() {
-        // Spot
-        let input = r#"{
-            "timezone": "UTC",
-            "symbols": [
-                {
-                    "symbol": "BTCUSDT",
-                    "status": "TRADING",
-                    "baseAsset": "BTC",
-                    "quoteAsset": "USDT"
-                }
-            ]
-        }"#;
+    fn test_whole_market_instrument_key_from_exchange_symbol() {
+        // Whole-market events are keyed by "{exchange}-{symbol}", lowercased
+        assert_eq!(
+            InstrumentNameInternal::new_from_exchange(ExchangeId::BinanceSpot, "BTCUSDT").as_ref(),
+            "binance_spot-btcusdt"
+        );
+        assert_eq!(
+            InstrumentNameInternal::new_from_exchange(ExchangeId::BinanceFuturesUsd, "BTCUSDT")
+                .as_ref(),
+            "binance_futures_usd-btcusdt"
+        );
 
-        let info = serde_json::from_str::<BinanceExchangeInfo>(input).unwrap();
-        assert_eq!(info.symbols[0].symbol, "BTCUSDT");
-        assert_eq!(info.symbols[0].base_asset, "BTC");
-        assert_eq!(info.symbols[0].quote_asset, "USDT");
-        assert_eq!(info.symbols[0].contract_type, None);
-        assert!(matches!(
-            spot_filter(&info.symbols[0]),
-            Some(MarketDataInstrumentKind::Spot)
-        ));
+        // Spot & perpetual BTCUSDT are distinct keys, since ExchangeId encodes the market type
+        assert_ne!(
+            InstrumentNameInternal::new_from_exchange(ExchangeId::BinanceSpot, "BTCUSDT"),
+            InstrumentNameInternal::new_from_exchange(ExchangeId::BinanceFuturesUsd, "BTCUSDT"),
+        );
 
-        // Futures perpetual
-        let input = r#"{
-            "symbols": [
-                {
-                    "symbol": "BTCUSDT",
-                    "pair": "BTCUSDT",
-                    "contractType": "PERPETUAL",
-                    "baseAsset": "BTC",
-                    "quoteAsset": "USDT"
-                },
-                {
-                    "symbol": "BTCUSDT_250627",
-                    "pair": "BTCUSDT_250627",
-                    "contractType": "CURRENT_QUARTER",
-                    "baseAsset": "BTC",
-                    "quoteAsset": "USDT"
-                }
-            ]
-        }"#;
+        // Delivery contracts are no longer filtered out, and retain their exchange symbol
+        assert_eq!(
+            InstrumentNameInternal::new_from_exchange(
+                ExchangeId::BinanceFuturesUsd,
+                "BTCUSDT_250627"
+            )
+            .as_ref(),
+            "binance_futures_usd-btcusdt_250627"
+        );
+    }
 
-        let info = serde_json::from_str::<BinanceExchangeInfo>(input).unwrap();
-        assert!(matches!(
-            perpetual_filter(&info.symbols[0]),
-            Some(MarketDataInstrumentKind::Perpetual)
-        ));
-        assert!(matches!(perpetual_filter(&info.symbols[1]), None));
+    #[tokio::test]
+    async fn test_whole_market_ticker_transformer_keys_events_per_symbol() {
+        // A `!miniTicker@arr` payload covering two symbols, one of which is a delivery contract
+        // that the removed `/exchangeInfo` universe would previously have filtered out
+        let input = serde_json::from_str::<Vec<BinanceTicker>>(
+            r#"[
+                {"e":"24hrMiniTicker","E":123456789,"s":"BTCUSDT","c":"1","o":"2","h":"3","l":"4","v":"5","q":"6"},
+                {"e":"24hrMiniTicker","E":123456789,"s":"BTCUSDT_250627","c":"1","o":"2","h":"3","l":"4","v":"5","q":"6"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut transformer = <BinanceWholeMarketTransformer<
+            BinanceServerFuturesUsd,
+            AllTickers,
+            BinanceTicker,
+        > as ExchangeTransformer<
+            Binance<BinanceServerFuturesUsd>,
+            InstrumentNameInternal,
+            AllTickers,
+        >>::init(Map(Default::default()), &[], tx)
+        .await
+        .unwrap();
+
+        let output = transformer
+            .transform(input)
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(
+            output[0].instrument.as_ref(),
+            "binance_futures_usd-btcusdt"
+        );
+        assert_eq!(
+            output[1].instrument.as_ref(),
+            "binance_futures_usd-btcusdt_250627"
+        );
+        assert_eq!(output[0].exchange, ExchangeId::BinanceFuturesUsd);
+    }
+
+    #[tokio::test]
+    async fn test_whole_market_funding_rate_transformer_keys_events_per_symbol() {
+        // The same generic transformer, instantiated for the `!markPrice@arr` array stream
+        let input = serde_json::from_str::<Vec<BinanceFundingRate>>(
+            r#"[
+                {"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT","p":"1","i":"2","P":"3","r":"0.0001","T":1562306400000},
+                {"e":"markPriceUpdate","E":1562305380000,"s":"ETHUSDT","p":"1","i":"2","P":"3","r":"0.0002","T":1562306400000}
+            ]"#,
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut transformer = <BinanceWholeMarketTransformer<
+            BinanceServerFuturesUsd,
+            AllFundingRates,
+            BinanceFundingRate,
+        > as ExchangeTransformer<
+            Binance<BinanceServerFuturesUsd>,
+            InstrumentNameInternal,
+            AllFundingRates,
+        >>::init(Map(Default::default()), &[], tx)
+        .await
+        .unwrap();
+
+        let output = transformer
+            .transform(input)
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].instrument.as_ref(), "binance_futures_usd-btcusdt");
+        assert_eq!(output[1].instrument.as_ref(), "binance_futures_usd-ethusdt");
+        assert_eq!(output[0].kind.funding_rate, 0.0001);
     }
 
     #[test]
